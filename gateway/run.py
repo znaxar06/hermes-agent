@@ -1695,6 +1695,7 @@ class GatewayRunner:
         self._busy_text_mode = self._load_busy_text_mode()
         self._restart_drain_timeout = self._load_restart_drain_timeout()
         self._provider_routing = self._load_provider_routing()
+        self._source_model_overrides = self._load_source_model_overrides()
         self._fallback_model = self._load_fallback_model()
 
         # Wire process registry into session store for reset protection
@@ -2397,6 +2398,9 @@ class GatewayRunner:
                 resolved_session_key or "", model,
                 list(self._session_model_overrides.keys())[:5] if self._session_model_overrides else "[]",
             )
+            source_override = self._resolve_source_model_override(source)
+            if source_override:
+                return source_override
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         runtime_model = runtime_kwargs.pop("model", None)
@@ -2827,6 +2831,153 @@ class GatewayRunner:
         return str(cfg_get(cfg, "agent", "system_prompt", default="") or "").strip()
 
     @staticmethod
+    def _load_source_model_overrides() -> dict:
+        """Load persistent platform/chat/thread model overrides from config.yaml."""
+        try:
+            import yaml as _y
+            cfg_path = _hermes_home / "config.yaml"
+            if cfg_path.exists():
+                with open(cfg_path, encoding="utf-8") as _f:
+                    cfg = _y.safe_load(_f) or {}
+                overrides = cfg.get("model_overrides") or {}
+                gateway_overrides = (cfg.get("gateway") or {}).get("model_overrides") or {}
+                if isinstance(overrides, dict) and isinstance(gateway_overrides, dict):
+                    merged = dict(overrides)
+                    for platform, platform_cfg in gateway_overrides.items():
+                        if isinstance(platform_cfg, dict) and isinstance(merged.get(platform), dict):
+                            merged[platform] = {**merged[platform], **platform_cfg}
+                        else:
+                            merged[platform] = platform_cfg
+                    return merged
+                return overrides if isinstance(overrides, dict) else {}
+        except Exception:
+            pass
+        return {}
+
+    def _resolve_source_model_override(self, source: Optional[SessionSource]) -> Optional[tuple[str, dict]]:
+        """Resolve a persistent model/provider override for a message source."""
+        if source is None:
+            return None
+        try:
+            platform = getattr(source.platform, "value", None) or str(source.platform).lower()
+            platform_cfg = (self._source_model_overrides or {}).get(platform) or {}
+            if not isinstance(platform_cfg, dict):
+                return None
+
+            chat_id = str(source.chat_id or "")
+            thread_id = str(source.thread_id or "") if source.thread_id else ""
+            candidates: list[dict] = []
+
+            threads = platform_cfg.get("threads") or {}
+            if thread_id and isinstance(threads, dict):
+                entry = threads.get(f"{chat_id}:{thread_id}") or threads.get(thread_id)
+                if isinstance(entry, dict):
+                    candidates.append(entry)
+
+            chats = platform_cfg.get("chats") or {}
+            if isinstance(chats, dict):
+                entry = chats.get(chat_id)
+                if isinstance(entry, dict):
+                    nested_threads = entry.get("threads") or {}
+                    if thread_id and isinstance(nested_threads, dict):
+                        nested = nested_threads.get(thread_id)
+                        if isinstance(nested, dict):
+                            candidates.append({**entry, **nested})
+                    candidates.append(entry)
+
+            chat_type = str(getattr(source, "chat_type", "") or "").lower()
+            if chat_type and chat_type not in {"dm", "direct", "private"}:
+                group_default_entry = platform_cfg.get("group_default")
+                if isinstance(group_default_entry, dict):
+                    candidates.append(group_default_entry)
+
+            default_entry = platform_cfg.get("default")
+            if isinstance(default_entry, dict):
+                candidates.append(default_entry)
+
+            for entry in candidates:
+                model = str(entry.get("model") or "").strip()
+                provider = str(entry.get("provider") or "").strip()
+                if not model:
+                    continue
+
+                if provider:
+                    from hermes_cli.runtime_provider import resolve_runtime_provider
+                    runtime = resolve_runtime_provider(requested=provider)
+                    runtime_kwargs = {
+                        "api_key": runtime.get("api_key"),
+                        "base_url": runtime.get("base_url"),
+                        "provider": runtime.get("provider"),
+                        "api_mode": runtime.get("api_mode"),
+                        "command": runtime.get("command"),
+                        "args": list(runtime.get("args") or []),
+                        "credential_pool": runtime.get("credential_pool"),
+                    }
+                else:
+                    runtime_kwargs = _resolve_runtime_agent_kwargs()
+
+                logger.info(
+                    "Source model override: platform=%s chat=%s thread=%s -> provider=%s model=%s",
+                    platform,
+                    chat_id,
+                    thread_id or "",
+                    runtime_kwargs.get("provider") or provider or "default",
+                    model,
+                )
+                return model, runtime_kwargs
+        except Exception:
+            logger.exception("Failed to resolve source model override")
+        return None
+
+    def _source_model_override_entry_for_source(self, source: Optional[SessionSource]) -> Optional[dict]:
+        """Return the raw persistent override entry for a source, preserving provider slug."""
+        if source is None:
+            return None
+        try:
+            platform = getattr(source.platform, "value", None) or str(source.platform).lower()
+            platform_cfg = (self._source_model_overrides or {}).get(platform) or {}
+            if not isinstance(platform_cfg, dict):
+                return None
+
+            chat_id = str(source.chat_id or "")
+            thread_id = str(source.thread_id or "") if source.thread_id else ""
+            candidates: list[dict] = []
+
+            threads = platform_cfg.get("threads") or {}
+            if thread_id and isinstance(threads, dict):
+                entry = threads.get(f"{chat_id}:{thread_id}") or threads.get(thread_id)
+                if isinstance(entry, dict):
+                    candidates.append(entry)
+
+            chats = platform_cfg.get("chats") or {}
+            if isinstance(chats, dict):
+                entry = chats.get(chat_id)
+                if isinstance(entry, dict):
+                    nested_threads = entry.get("threads") or {}
+                    if thread_id and isinstance(nested_threads, dict):
+                        nested = nested_threads.get(thread_id)
+                        if isinstance(nested, dict):
+                            candidates.append({**entry, **nested})
+                    candidates.append(entry)
+
+            chat_type = str(getattr(source, "chat_type", "") or "").lower()
+            if chat_type and chat_type not in {"dm", "direct", "private"}:
+                group_default_entry = platform_cfg.get("group_default")
+                if isinstance(group_default_entry, dict):
+                    candidates.append(group_default_entry)
+
+            default_entry = platform_cfg.get("default")
+            if isinstance(default_entry, dict):
+                candidates.append(default_entry)
+
+            for entry in candidates:
+                if str(entry.get("model") or "").strip():
+                    return entry
+        except Exception:
+            logger.debug("Failed to inspect raw source model override", exc_info=True)
+        return None
+
+    @staticmethod
     def _load_reasoning_config() -> dict | None:
         """Load reasoning effort from config.yaml.
 
@@ -2885,6 +3036,20 @@ class GatewayRunner:
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
         if resolved_session_key and resolved_session_key in overrides:
             return overrides[resolved_session_key]
+
+        if source is not None:
+            try:
+                entry = self._source_model_override_entry_for_source(source)
+                effort = str((entry or {}).get("reasoning_effort") or "").strip()
+                if effort:
+                    from hermes_constants import parse_reasoning_effort
+                    parsed = parse_reasoning_effort(effort)
+                    if parsed is not None:
+                        return parsed
+                    logger.warning("Unknown source reasoning_effort '%s', using global/default", effort)
+            except Exception:
+                logger.debug("Failed to resolve source reasoning override", exc_info=True)
+
         return self._load_reasoning_config()
 
     def _set_session_reasoning_override(
@@ -10278,6 +10443,26 @@ class GatewayRunner:
             current_provider = override.get("provider", current_provider)
             current_base_url = override.get("base_url", current_base_url)
             current_api_key = override.get("api_key", current_api_key)
+        else:
+            source_entry = self._source_model_override_entry_for_source(source)
+            if source_entry:
+                source_model = str(source_entry.get("model") or "").strip()
+                source_provider = str(source_entry.get("provider") or "").strip()
+                if source_model:
+                    current_model = source_model
+                if source_provider:
+                    current_provider = source_provider
+                    try:
+                        from hermes_cli.runtime_provider import resolve_runtime_provider
+                        source_runtime = resolve_runtime_provider(requested=source_provider)
+                        current_base_url = source_runtime.get("base_url", current_base_url) or current_base_url
+                        current_api_key = source_runtime.get("api_key", current_api_key) or current_api_key
+                    except Exception:
+                        logger.debug(
+                            "Failed to resolve source provider for /model display: %s",
+                            source_provider,
+                            exc_info=True,
+                        )
 
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:

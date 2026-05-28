@@ -4476,6 +4476,56 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_allowed_threads_by_chat(self) -> dict[str, set[str]]:
+        """Return per-chat Telegram forum topic allowlists.
+
+        Shape: ``{chat_id: {thread_id, ...}}`` from
+        ``platforms.telegram.extra.allowed_threads_by_chat``. Unlike the legacy
+        global ``allowed_topics`` gate, this only applies to chats explicitly
+        present in the mapping so topic IDs can be scoped to one supergroup.
+        """
+        raw = self.config.extra.get("allowed_threads_by_chat")
+        if raw is None:
+            raw_env = os.getenv("TELEGRAM_ALLOWED_THREADS_BY_CHAT", "").strip()
+            if not raw_env:
+                return {}
+            try:
+                raw = json.loads(raw_env)
+            except Exception:
+                logger.warning("[%s] Ignoring invalid TELEGRAM_ALLOWED_THREADS_BY_CHAT JSON", self.name)
+                return {}
+
+        if not isinstance(raw, dict):
+            logger.warning(
+                "[%s] telegram allowed_threads_by_chat must be a mapping; got %s",
+                self.name,
+                type(raw).__name__,
+            )
+            return {}
+
+        allowed: dict[str, set[str]] = {}
+        for chat_id, threads in raw.items():
+            chat_key = str(chat_id).strip()
+            if not chat_key:
+                continue
+            if isinstance(threads, (list, tuple, set)):
+                values = threads
+            else:
+                values = str(threads).split(",")
+            thread_set = {str(value).strip() for value in values if str(value).strip()}
+            if thread_set:
+                allowed[chat_key] = thread_set
+        return allowed
+
+    def _telegram_chat_thread_allowed(self, chat_id: str, thread_id: Optional[Any]) -> bool:
+        """Return whether ``thread_id`` is allowed for ``chat_id`` if scoped."""
+        allowed_by_chat = self._telegram_allowed_threads_by_chat()
+        allowed_threads = allowed_by_chat.get(str(chat_id))
+        if not allowed_threads:
+            return True
+        topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
+        return topic_id in allowed_threads
+
     def _telegram_ignored_threads(self) -> set[int]:
         raw = self.config.extra.get("ignored_threads")
         if raw is None:
@@ -4716,6 +4766,10 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
 
         thread_id = getattr(message, "message_thread_id", None)
+        chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
+        if not self._telegram_chat_thread_allowed(chat_id_str, thread_id):
+            return False
+
         allowed_topics = self._telegram_allowed_topics()
         if allowed_topics:
             topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
@@ -4729,7 +4783,6 @@ class TelegramAdapter(BasePlatformAdapter):
             except (TypeError, ValueError):
                 return False
 
-        chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
         if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
             return False
 
@@ -4860,6 +4913,10 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
 
         thread_id = getattr(message, "message_thread_id", None)
+        chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
+        if not self._telegram_chat_thread_allowed(chat_id_str, thread_id):
+            return False
+
         allowed_topics = self._telegram_allowed_topics()
         if allowed_topics:
             topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
@@ -4881,8 +4938,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 if not is_command and chat_id in self._dm_topic_chat_ids:
                     return False
             return True
-
-        chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
 
         if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
             return False
