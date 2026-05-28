@@ -31,6 +31,11 @@ def _make_agent():
         base_url="https://chatgpt.com/backend-api/codex",
         provider="openai-codex",
         model="gpt-5.4",
+        # These tests exercise _create_openai_client() proxy wiring only.  Keep
+        # tool loading disabled so a proxy-env regression test cannot trigger
+        # lazy dependency installation for unrelated optional tools in fresh CI
+        # runners.
+        enabled_toolsets=[],
         quiet_mode=True,
         skip_context_files=True,
         skip_memory=True,
